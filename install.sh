@@ -1,61 +1,603 @@
 #!/bin/bash
 
 # ============================================
-# Speedtest-X 一键安装/卸载脚本 (Nginx + PHP-FPM)
-# 用法: ./speedtest.sh          # 安装并启动
-#       ./speedtest.sh uninstall # 完全卸载
+# Speedtest-X 一键安装/卸载/管理脚本 (Nginx + PHP-FPM)
+# 用法: ./speedtest.sh              # 安装并启动
+#       ./speedtest.sh uninstall     # 完全卸载
+#       ./speedtest.sh menu          # 弹出管理菜单
+#       安装后可使用 st 命令管理
 # ============================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 # ---------- 配置 ----------
 PROJECT_DIR="/www/wwwroot/speedtest"
 LOG_FILE="/var/log/speedtest_access.log"
+ST_COMMAND_PATH="/usr/local/bin/st"
+
+# ========== 检测系统 ==========
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    elif [ -f /etc/alpine-release ]; then
+        OS="alpine"
+    else
+        echo -e "${RED}无法检测操作系统${NC}"
+        exit 1
+    fi
+}
 
 # ========== 端口占用检测函数 ==========
 check_port() {
     local port=$1
     if command -v ss &>/dev/null; then
         if ss -tlnp | grep -q ":$port "; then
-            return 0  # 端口被占用
+            return 0
         fi
     elif command -v netstat &>/dev/null; then
         if netstat -tlnp | grep -q ":$port "; then
-            return 0  # 端口被占用
+            return 0
         fi
     else
-        # 使用 lsof 作为备选
         if command -v lsof &>/dev/null; then
             if lsof -i :$port &>/dev/null; then
                 return 0
             fi
         fi
     fi
-    return 1  # 端口未被占用
+    return 1
 }
 
 # ========== 端口输入验证函数 ==========
 validate_port() {
     local port=$1
-    # 检查是否为数字
     if ! [[ "$port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 端口必须为数字${NC}"
         return 1
     fi
-    # 检查端口范围
     if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
         echo -e "${RED}错误: 端口范围必须在 1-65535 之间${NC}"
         return 1
     fi
-    # 检查是否为系统保留端口（可选）
     if [ "$port" -lt 1024 ] && [ "$(id -u)" -ne 0 ]; then
         echo -e "${YELLOW}警告: 端口 1-1023 为系统保留端口，需要 root 权限${NC}"
     fi
     return 0
+}
+
+# ========== 安装 st 命令（完全独立版本）==========
+install_st_command() {
+    echo -e "${GREEN}安装全局命令 'st'...${NC}"
+    
+    # 检测并保存实际的配置信息
+    local ACTUAL_PORT=""
+    local ACTUAL_PHP_SOCKET=""
+    local ACTUAL_PHP_FPM_SERVICE=""
+    
+    # 获取端口
+    if [ -f "/etc/nginx/http.d/speedtest.conf" ]; then
+        ACTUAL_PORT=$(grep -oP 'listen \K[0-9]+' /etc/nginx/http.d/speedtest.conf | head -1)
+    elif [ -f "/etc/nginx/conf.d/speedtest.conf" ]; then
+        ACTUAL_PORT=$(grep -oP 'listen \K[0-9]+' /etc/nginx/conf.d/speedtest.conf | head -1)
+    elif [ -f "/etc/nginx/sites-enabled/speedtest" ]; then
+        ACTUAL_PORT=$(grep -oP 'listen \K[0-9]+' /etc/nginx/sites-enabled/speedtest | head -1)
+    fi
+    
+    # 获取 PHP socket
+    if [ -f "/etc/nginx/http.d/speedtest.conf" ]; then
+        ACTUAL_PHP_SOCKET=$(grep -oP 'fastcgi_pass \K[^;]+' /etc/nginx/http.d/speedtest.conf | head -1)
+    elif [ -f "/etc/nginx/conf.d/speedtest.conf" ]; then
+        ACTUAL_PHP_SOCKET=$(grep -oP 'fastcgi_pass \K[^;]+' /etc/nginx/conf.d/speedtest.conf | head -1)
+    fi
+    
+    # 检测 PHP-FPM 服务名
+    if command -v rc-service &>/dev/null; then
+        for svc in php-fpm php-fpm82 php-fpm83 php-fpm8 php-fpm7; do
+            if rc-service $svc status 2>/dev/null | grep -q "started"; then
+                ACTUAL_PHP_FPM_SERVICE=$svc
+                break
+            fi
+        done
+    elif command -v systemctl &>/dev/null; then
+        ACTUAL_PHP_FPM_SERVICE=$(systemctl list-units --type=service | grep -oP 'php.*-fpm\.service' | head -1 | sed 's/\.service//')
+    fi
+    [ -z "$ACTUAL_PHP_FPM_SERVICE" ] && ACTUAL_PHP_FPM_SERVICE="php-fpm"
+    
+    # 创建完全独立的 st 命令
+    cat > "$ST_COMMAND_PATH" << 'STEOF'
+#!/bin/bash
+# ============================================
+# Speedtest-X 管理命令 (独立版本)
+# ============================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# 硬编码配置（安装时写入）
+PROJECT_DIR="/www/wwwroot/speedtest"
+STEOF
+    
+    # 动态写入配置
+    cat >> "$ST_COMMAND_PATH" << EOF
+PORT="${ACTUAL_PORT:-unknown}"
+PHP_FPM_SERVICE="${ACTUAL_PHP_FPM_SERVICE:-php-fpm}"
+EOF
+    
+    # 继续写入函数定义
+    cat >> "$ST_COMMAND_PATH" << 'STEOF'
+
+# ========== 显示菜单 ==========
+show_menu() {
+    clear
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║        Speedtest-X 管理菜单           ║${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${GREEN}  1)${NC} ${BOLD}启动服务${NC}"
+    echo -e "${YELLOW}  2)${NC} ${BOLD}重启服务${NC}"
+    echo -e "${BLUE}  3)${NC} ${BOLD}查看状态${NC}"
+    echo -e "${RED}  4)${NC} ${BOLD}停止服务${NC}"
+    echo -e "${CYAN}  5)${NC} ${BOLD}查看日志${NC}"
+    echo -e "${CYAN}  6)${NC} ${BOLD}配置信息${NC}"
+    echo -e "${RED}  7)${NC} ${BOLD}卸载程序${NC}"
+    echo ""
+    echo -e "${BOLD}  0)${NC} ${BOLD}退出${NC}"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    read -p "$(echo -e ${BOLD}"请选择操作 [0-7]: "${NC})" choice
+    
+    case $choice in
+        1) start_services ;;
+        2) restart_services ;;
+        3) show_status ;;
+        4) stop_services ;;
+        5) show_logs ;;
+        6) show_config ;;
+        7) uninstall_speedtest ;;
+        0) echo -e "${GREEN}再见！${NC}"; exit 0 ;;
+        *) echo -e "${RED}无效选择！${NC}"; sleep 1; show_menu ;;
+    esac
+}
+
+# ========== 端口检测 ==========
+check_port() {
+    local port=$1
+    if command -v ss &>/dev/null; then
+        ss -tlnp | grep -q ":$port "
+        return $?
+    elif command -v netstat &>/dev/null; then
+        netstat -tlnp | grep -q ":$port "
+        return $?
+    elif command -v lsof &>/dev/null; then
+        lsof -i :$port &>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+# ========== 启动服务 ==========
+start_services() {
+    echo -e "${GREEN}正在启动服务...${NC}"
+    
+    if [ ! -f "$PROJECT_DIR/index.html" ] && [ ! -f "$PROJECT_DIR/index.php" ]; then
+        echo -e "${RED}错误: Speedtest-X 未安装！${NC}"
+        sleep 2
+        show_menu
+        return
+    fi
+    
+    # 启动 PHP-FPM
+    if command -v rc-service &>/dev/null; then
+        rc-service $PHP_FPM_SERVICE start 2>/dev/null || {
+            for svc in php-fpm php-fpm82 php-fpm83 php-fpm8; do
+                rc-service $svc start 2>/dev/null && break
+            done
+        }
+    elif command -v systemctl &>/dev/null; then
+        systemctl start $PHP_FPM_SERVICE 2>/dev/null || systemctl start php*-fpm 2>/dev/null
+    else
+        service $PHP_FPM_SERVICE start 2>/dev/null || service php-fpm start 2>/dev/null
+    fi
+    
+    # 启动 Nginx
+    if command -v rc-service &>/dev/null; then
+        rc-service nginx start
+    elif command -v systemctl &>/dev/null; then
+        systemctl start nginx
+    else
+        service nginx start
+    fi
+    
+    sleep 1
+    echo -e "${GREEN}服务已启动！${NC}"
+    show_status
+    echo ""
+    read -p "按回车键返回菜单..." 
+    show_menu
+}
+
+# ========== 停止服务 ==========
+stop_services() {
+    echo -e "${YELLOW}正在停止服务...${NC}"
+    
+    # 停止 PHP-FPM
+    if command -v rc-service &>/dev/null; then
+        rc-service $PHP_FPM_SERVICE stop 2>/dev/null || {
+            for svc in php-fpm php-fpm82 php-fpm83 php-fpm8; do
+                rc-service $svc stop 2>/dev/null
+            done
+        }
+    elif command -v systemctl &>/dev/null; then
+        systemctl stop $PHP_FPM_SERVICE 2>/dev/null || systemctl stop php*-fpm 2>/dev/null
+    else
+        service $PHP_FPM_SERVICE stop 2>/dev/null || service php-fpm stop 2>/dev/null
+    fi
+    
+    # 停止 Nginx
+    if command -v rc-service &>/dev/null; then
+        rc-service nginx stop
+    elif command -v systemctl &>/dev/null; then
+        systemctl stop nginx
+    else
+        service nginx stop
+    fi
+    
+    sleep 1
+    echo -e "${GREEN}服务已停止！${NC}"
+    show_status
+    echo ""
+    read -p "按回车键返回菜单..." 
+    show_menu
+}
+
+# ========== 重启服务 ==========
+restart_services() {
+    echo -e "${YELLOW}正在重启服务...${NC}"
+    
+    if [ ! -f "$PROJECT_DIR/index.html" ] && [ ! -f "$PROJECT_DIR/index.php" ]; then
+        echo -e "${RED}错误: Speedtest-X 未安装！${NC}"
+        sleep 2
+        show_menu
+        return
+    fi
+    
+    # 重启 PHP-FPM
+    if command -v rc-service &>/dev/null; then
+        rc-service $PHP_FPM_SERVICE restart 2>/dev/null || {
+            for svc in php-fpm php-fpm82 php-fpm83 php-fpm8; do
+                rc-service $svc restart 2>/dev/null && break
+            done
+        }
+    elif command -v systemctl &>/dev/null; then
+        systemctl restart $PHP_FPM_SERVICE 2>/dev/null || systemctl restart php*-fpm 2>/dev/null
+    else
+        service $PHP_FPM_SERVICE restart 2>/dev/null || service php-fpm restart 2>/dev/null
+    fi
+    
+    # 重启 Nginx
+    if command -v rc-service &>/dev/null; then
+        rc-service nginx restart
+    elif command -v systemctl &>/dev/null; then
+        systemctl restart nginx
+    else
+        service nginx restart
+    fi
+    
+    sleep 1
+    echo -e "${GREEN}服务已重启！${NC}"
+    show_status
+    echo ""
+    read -p "按回车键返回菜单..." 
+    show_menu
+}
+
+# ========== 查看状态 ==========
+show_status() {
+    echo -e "\n${BOLD}${CYAN}════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}          Speedtest-X 运行状态${NC}"
+    echo -e "${BOLD}${CYAN}════════════════════════════════════════${NC}\n"
+    
+    # Nginx 状态
+    echo -e "${BOLD}Nginx:${NC}"
+    if pgrep -x "nginx" > /dev/null 2>&1; then
+        echo -e "  ${GREEN}● 运行中${NC}  PID: $(pgrep -x nginx | head -1)  进程: $(pgrep -cx nginx)"
+    else
+        echo -e "  ${RED}● 未运行${NC}"
+    fi
+    
+    # PHP-FPM 状态
+    echo -e "${BOLD}PHP-FPM:${NC}"
+    if pgrep -f "php-fpm" > /dev/null 2>&1; then
+        echo -e "  ${GREEN}● 运行中${NC}  PID: $(pgrep -f 'php-fpm' | head -1)  进程: $(pgrep -cf 'php-fpm')"
+    else
+        echo -e "  ${RED}● 未运行${NC}"
+    fi
+    
+    # 端口监听
+    echo -e "${BOLD}端口 ${PORT}:${NC}"
+    if [ -n "$PORT" ] && [ "$PORT" != "unknown" ]; then
+        if check_port $PORT; then
+            echo -e "  ${GREEN}● 监听中${NC}"
+        else
+            echo -e "  ${RED}● 未监听${NC}"
+        fi
+    else
+        echo -e "  ${YELLOW}● 未知${NC}"
+    fi
+    
+    # 访问测试
+    if [ -n "$PORT" ] && [ "$PORT" != "unknown" ]; then
+        echo -e "${BOLD}访问测试:${NC}"
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 3 http://127.0.0.1:$PORT 2>/dev/null)
+        if [ "$HTTP_CODE" = "200" ]; then
+            echo -e "  ${GREEN}● 正常${NC} (HTTP $HTTP_CODE)"
+        elif [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "000" ]; then
+            echo -e "  ${YELLOW}● HTTP $HTTP_CODE${NC}"
+        else
+            echo -e "  ${RED}● 无法访问${NC}"
+        fi
+    fi
+    
+    # 系统资源
+    echo -e "\n${BOLD}系统资源:${NC}"
+    if command -v free &>/dev/null; then
+        MEM=$(free -m | awk '/^Mem:/{printf "%.1f%%", $3/$2*100}')
+        echo -e "  内存使用: ${MEM}"
+    fi
+    
+    # 项目大小
+    if [ -d "$PROJECT_DIR" ]; then
+        DISK=$(du -sh $PROJECT_DIR 2>/dev/null | awk '{print $1}')
+        echo -e "  项目大小: ${DISK}"
+    fi
+    
+    echo -e "\n${BOLD}${CYAN}════════════════════════════════════════${NC}\n"
+}
+
+# ========== 查看日志 ==========
+show_logs() {
+    clear
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║           日志查看菜单                 ║${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${GREEN}  1)${NC} 访问日志 (最近20行)"
+    echo -e "${YELLOW}  2)${NC} 错误日志 (最近20行)"
+    echo -e "${BLUE}  3)${NC} Nginx 系统错误日志"
+    echo -e "${RED}  4)${NC} 实时监控访问日志"
+    echo -e "${CYAN}  5)${NC} 查看全部访问日志"
+    echo ""
+    echo -e "${BOLD}  0)${NC} 返回主菜单"
+    echo ""
+    
+    read -p "$(echo -e ${BOLD}"请选择 [0-5]: "${NC})" log_choice
+    
+    case $log_choice in
+        1)
+            echo -e "\n${BOLD}最近20行访问日志:${NC}"
+            if [ -f "/var/log/nginx/speedtest_access.log" ]; then
+                tail -20 /var/log/nginx/speedtest_access.log
+            else
+                echo -e "${RED}日志文件不存在${NC}"
+            fi
+            ;;
+        2)
+            echo -e "\n${BOLD}最近20行错误日志:${NC}"
+            if [ -f "/var/log/nginx/speedtest_error.log" ]; then
+                tail -20 /var/log/nginx/speedtest_error.log
+            else
+                echo -e "${RED}日志文件不存在${NC}"
+            fi
+            ;;
+        3)
+            echo -e "\n${BOLD}最近20行 Nginx 错误日志:${NC}"
+            if [ -f "/var/log/nginx/error.log" ]; then
+                tail -20 /var/log/nginx/error.log
+            else
+                echo -e "${RED}日志文件不存在${NC}"
+            fi
+            ;;
+        4)
+            echo -e "${YELLOW}实时监控访问日志 (Ctrl+C 退出)...${NC}"
+            if [ -f "/var/log/nginx/speedtest_access.log" ]; then
+                tail -f /var/log/nginx/speedtest_access.log
+            else
+                echo -e "${RED}日志文件不存在${NC}"
+                sleep 2
+            fi
+            ;;
+        5)
+            echo -e "\n${BOLD}全部访问日志:${NC}"
+            if [ -f "/var/log/nginx/speedtest_access.log" ]; then
+                less /var/log/nginx/speedtest_access.log
+            else
+                echo -e "${RED}日志文件不存在${NC}"
+                sleep 2
+            fi
+            ;;
+        0)
+            show_menu
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选择！${NC}"
+            sleep 1
+            ;;
+    esac
+    
+    echo ""
+    read -p "按回车键继续..." 
+    show_logs
+}
+
+# ========== 显示配置信息 ==========
+show_config() {
+    clear
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║         Speedtest-X 配置信息          ║${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}\n"
+    
+    # 获取 IP
+    IP=$(curl -s -m 3 4.ipw.cn 2>/dev/null || curl -s -m 3 ipinfo.io/ip 2>/dev/null || echo "未知")
+    
+    echo -e "${BOLD}访问地址:${NC}"
+    echo -e "  🌐 http://${IP}:${PORT}"
+    echo -e "  🏠 http://localhost:${PORT}"
+    echo ""
+    echo -e "${BOLD}项目目录:${NC} ${PROJECT_DIR}"
+    echo -e "${BOLD}监听端口:${NC} ${PORT}"
+    echo ""
+    
+    # 显示 Nginx 配置
+    CONF_FILE=""
+    if [ -f "/etc/nginx/http.d/speedtest.conf" ]; then
+        CONF_FILE="/etc/nginx/http.d/speedtest.conf"
+    elif [ -f "/etc/nginx/conf.d/speedtest.conf" ]; then
+        CONF_FILE="/etc/nginx/conf.d/speedtest.conf"
+    elif [ -f "/etc/nginx/sites-enabled/speedtest" ]; then
+        CONF_FILE="/etc/nginx/sites-enabled/speedtest"
+    fi
+    
+    if [ -n "$CONF_FILE" ]; then
+        echo -e "${BOLD}配置文件:${NC} ${CONF_FILE}"
+        echo -e "${BOLD}PHP Socket:${NC} $(grep fastcgi_pass $CONF_FILE | awk '{print $2}' | tr -d ';')"
+    fi
+    
+    echo ""
+    
+    # 版本信息
+    if command -v nginx &>/dev/null; then
+        echo -e "${BOLD}Nginx:${NC} $(nginx -v 2>&1 | grep -oP 'nginx/\K[0-9.]+')"
+    fi
+    if command -v php &>/dev/null; then
+        echo -e "${BOLD}PHP:${NC} $(php -v 2>/dev/null | head -1 | grep -oP 'PHP \K[0-9.]+')"
+    fi
+    
+    echo ""
+    read -p "按回车键返回菜单..." 
+    show_menu
+}
+
+# ========== 卸载程序 ==========
+uninstall_speedtest() {
+    clear
+    echo -e "${RED}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${RED}${BOLD}║          警告：即将卸载！             ║${NC}"
+    echo -e "${RED}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}这将删除:${NC}"
+    echo -e "  - Speedtest-X 项目文件"
+    echo -e "  - Nginx 配置文件"
+    echo -e "  - st 管理命令"
+    echo ""
+    
+    read -p "$(echo -e ${RED}"确认卸载？输入 YES 继续: "${NC})" confirm
+    
+    if [ "$confirm" != "YES" ]; then
+        echo -e "${GREEN}已取消卸载${NC}"
+        sleep 1
+        show_menu
+        return
+    fi
+    
+    echo -e "${YELLOW}正在卸载...${NC}"
+    
+    # 停止服务
+    if command -v rc-service &>/dev/null; then
+        rc-service nginx stop 2>/dev/null
+        for svc in php-fpm php-fpm82 php-fpm83 php-fpm8; do
+            rc-service $svc stop 2>/dev/null
+        done
+    elif command -v systemctl &>/dev/null; then
+        systemctl stop nginx 2>/dev/null
+        systemctl stop php*-fpm 2>/dev/null
+    else
+        service nginx stop 2>/dev/null
+        service php-fpm stop 2>/dev/null
+    fi
+    
+    # 删除配置文件
+    rm -f /etc/nginx/http.d/speedtest.conf
+    rm -f /etc/nginx/conf.d/speedtest.conf
+    rm -f /etc/nginx/sites-available/speedtest
+    rm -f /etc/nginx/sites-enabled/speedtest
+    
+    # 重载 Nginx
+    if command -v nginx &>/dev/null; then
+        nginx -s reload 2>/dev/null || true
+    fi
+    
+    # 删除项目
+    rm -rf "$PROJECT_DIR"
+    
+    # 删除日志
+    rm -f /var/log/nginx/speedtest_access.log
+    rm -f /var/log/nginx/speedtest_error.log
+    
+    # 删除自己
+    rm -f /usr/local/bin/st
+    
+    # 询问是否删除 Nginx + PHP
+    echo ""
+    read -p "是否同时卸载 Nginx 和 PHP？(y/N): " remove_all
+    
+    if [[ "$remove_all" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}卸载 Nginx 和 PHP...${NC}"
+        
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            case $ID in
+                alpine)
+                    apk del --purge nginx php* 2>/dev/null
+                    ;;
+                ubuntu|debian)
+                    apt-get purge -y nginx php* 2>/dev/null
+                    apt-get autoremove -y 2>/dev/null
+                    ;;
+                centos|rhel|fedora|rocky|almalinux)
+                    if command -v dnf &>/dev/null; then
+                        dnf remove -y nginx php* 2>/dev/null
+                    else
+                        yum remove -y nginx php* 2>/dev/null
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+    
+    echo -e "${GREEN}卸载完成！${NC}"
+    exit 0
+}
+
+# ========== 主程序 ==========
+# 检查 root 权限
+if [ "$(id -u)" != "0" ]; then
+    echo -e "${RED}错误: 请使用 root 权限运行此命令${NC}"
+    echo -e "${YELLOW}用法: sudo st${NC}"
+    exit 1
+fi
+
+# 如果没有参数，显示菜单
+show_menu
+STEOF
+    
+    chmod +x "$ST_COMMAND_PATH"
+    
+    echo -e "${GREEN}✓ 全局命令 'st' 安装成功${NC}"
+    echo -e "${YELLOW}现在可以在任意位置使用 'st' 命令管理 Speedtest-X${NC}"
 }
 
 # ========== 卸载函数 ==========
@@ -81,22 +623,18 @@ uninstall() {
     # 删除自启动项
     echo -e "${YELLOW}删除自启动项...${NC}"
     if command -v rc-update &>/dev/null; then
-        # Alpine OpenRC
         rc-update del nginx default 2>/dev/null || true
         rc-update del php-fpm default 2>/dev/null || true
         rc-update del php-fpm82 default 2>/dev/null || true
         rc-update del php-fpm83 default 2>/dev/null || true
     elif command -v systemctl &>/dev/null; then
-        # Systemd
         systemctl disable nginx 2>/dev/null || true
         systemctl disable php-fpm 2>/dev/null || true
         systemctl disable php*-fpm 2>/dev/null || true
     elif command -v chkconfig &>/dev/null; then
-        # CentOS 6
         chkconfig nginx off 2>/dev/null || true
         chkconfig php-fpm off 2>/dev/null || true
     elif command -v update-rc.d &>/dev/null; then
-        # Debian/Ubuntu
         update-rc.d nginx remove 2>/dev/null || true
         update-rc.d php-fpm remove 2>/dev/null || true
         update-rc.d php*-fpm remove 2>/dev/null || true
@@ -109,7 +647,7 @@ uninstall() {
     rm -f /etc/nginx/sites-available/speedtest 2>/dev/null
     rm -f /etc/nginx/sites-enabled/speedtest 2>/dev/null
 
-    # 重载 Nginx (如果还存在)
+    # 重载 Nginx
     if command -v nginx &>/dev/null; then
         if command -v rc-service &>/dev/null; then
             rc-service nginx reload 2>/dev/null || true
@@ -121,19 +659,18 @@ uninstall() {
     # 删除项目目录
     rm -rf "$PROJECT_DIR"
 
-    # 询问是否卸载 Nginx + PHP - 修复：从 /dev/tty 读取输入
+    # 删除 st 命令
+    rm -f "$ST_COMMAND_PATH"
+
+    # 询问是否卸载 Nginx + PHP
     echo -e "${YELLOW}是否同时卸载 Nginx 和 PHP？${NC}"
     echo -e "${YELLOW}这将删除所有相关软件包！${NC}"
     
-    # 尝试从 /dev/tty 读取，如果失败则从标准输入读取
     if [ -t 0 ]; then
-        # 标准输入是终端，直接读取
         read -p "请输入 (y/N): " REMOVE_NGINX
     elif [ -e /dev/tty ]; then
-        # 通过管道执行时，从 /dev/tty 读取
         read -p "请输入 (y/N): " REMOVE_NGINX < /dev/tty
     else
-        # 无法交互，默认不卸载
         echo -e "${YELLOW}无法获取输入，默认不卸载 Nginx 和 PHP${NC}"
         REMOVE_NGINX="n"
     fi
@@ -168,36 +705,123 @@ uninstall() {
     exit 0
 }
 
-# ========== 检测系统 ==========
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-    elif [ -f /etc/alpine-release ]; then
-        OS="alpine"
-    else
-        echo -e "${RED}无法检测操作系统${NC}"
-        exit 1
-    fi
+# ========== 显示菜单（安装脚本中的）==========
+show_menu_installer() {
+    clear
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║        Speedtest-X 管理菜单           ║${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${GREEN}  1)${NC} ${BOLD}启动服务${NC}"
+    echo -e "${YELLOW}  2)${NC} ${BOLD}重启服务${NC}"
+    echo -e "${BLUE}  3)${NC} ${BOLD}查看状态${NC}"
+    echo -e "${RED}  4)${NC} ${BOLD}卸载程序${NC}"
+    echo ""
+    echo -e "${BOLD}  0)${NC} ${BOLD}退出${NC}"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    read -p "$(echo -e ${BOLD}"请选择操作 [0-4]: "${NC})" choice
+    
+    case $choice in
+        1)
+            # 启动服务
+            echo -e "${GREEN}正在启动服务...${NC}"
+            if command -v rc-service &>/dev/null; then
+                rc-service php-fpm start 2>/dev/null || rc-service php-fpm82 start 2>/dev/null || rc-service php-fpm83 start 2>/dev/null
+                rc-service nginx start
+            elif command -v systemctl &>/dev/null; then
+                systemctl start php-fpm 2>/dev/null || systemctl start php*-fpm 2>/dev/null
+                systemctl start nginx
+            else
+                service php-fpm start 2>/dev/null
+                service nginx start
+            fi
+            echo -e "${GREEN}服务已启动！${NC}"
+            sleep 1
+            show_menu_installer
+            ;;
+        2)
+            # 重启服务
+            echo -e "${YELLOW}正在重启服务...${NC}"
+            if command -v rc-service &>/dev/null; then
+                rc-service php-fpm restart 2>/dev/null || rc-service php-fpm82 restart 2>/dev/null || rc-service php-fpm83 restart 2>/dev/null
+                rc-service nginx restart
+            elif command -v systemctl &>/dev/null; then
+                systemctl restart php-fpm 2>/dev/null || systemctl restart php*-fpm 2>/dev/null
+                systemctl restart nginx
+            else
+                service php-fpm restart 2>/dev/null
+                service nginx restart
+            fi
+            echo -e "${GREEN}服务已重启！${NC}"
+            sleep 1
+            show_menu_installer
+            ;;
+        3)
+            # 查看状态
+            echo -e "\n${BOLD}服务状态:${NC}"
+            if pgrep -x "nginx" > /dev/null; then
+                echo -e "${GREEN}✓ Nginx 运行中${NC}"
+            else
+                echo -e "${RED}✗ Nginx 未运行${NC}"
+            fi
+            if pgrep -f "php-fpm" > /dev/null; then
+                echo -e "${GREEN}✓ PHP-FPM 运行中${NC}"
+            else
+                echo -e "${RED}✗ PHP-FPM 未运行${NC}"
+            fi
+            echo ""
+            read -p "按回车键返回菜单..." 
+            show_menu_installer
+            ;;
+        4)
+            uninstall
+            ;;
+        0)
+            echo -e "${GREEN}再见！${NC}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选择！${NC}"
+            sleep 1
+            show_menu_installer
+            ;;
+    esac
 }
 
+# ========== 主程序 ==========
 detect_os
 echo -e "${GREEN}操作系统: $OS${NC}"
 
-# ========== 如果执行卸载 ==========
-[ "$1" = "uninstall" ] && uninstall
+# ========== 处理命令参数 ==========
+case "${1:-install}" in
+    uninstall)
+        uninstall
+        ;;
+    menu)
+        show_menu_installer
+        exit 0
+        ;;
+    install|"")
+        # 继续执行安装流程
+        ;;
+    *)
+        echo -e "${RED}未知命令: $1${NC}"
+        echo -e "用法: $0 [install|uninstall|menu]"
+        exit 1
+        ;;
+esac
 
 # ========== 端口输入 ==========
 echo -e "${BLUE}================================${NC}"
 echo -e "${BLUE}   请输入要使用的端口号${NC}"
 echo -e "${BLUE}================================${NC}"
 
-# 如果提供了命令行参数作为端口
-if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; then
-    PORT=$1
+if [ -n "$2" ] && [[ "$2" =~ ^[0-9]+$ ]]; then
+    PORT=$2
     echo -e "${GREEN}使用命令行参数端口: $PORT${NC}"
 else
-    # 交互式输入端口
     while true; do
         read -p "请输入端口号 (默认: 33332): " INPUT_PORT
         PORT=${INPUT_PORT:-33332}
@@ -231,7 +855,6 @@ if check_port $PORT; then
     
     case $PORT_CHOICE in
         1)
-            # 获取占用端口的进程PID
             if command -v ss &>/dev/null; then
                 PID=$(ss -tlnp | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
             elif command -v netstat &>/dev/null; then
@@ -280,7 +903,6 @@ case $OS in
         PHP_SOCKET="unix:/run/php/php-fpm.sock"
         PHP_FPM_SERVICE="php-fpm82"
         
-        # 尝试检测正确的 PHP-FPM 版本
         if ! rc-service $PHP_FPM_SERVICE status 2>/dev/null | grep -q "started"; then
             PHP_FPM_SERVICE="php-fpm83"
         fi
@@ -288,12 +910,10 @@ case $OS in
             PHP_FPM_SERVICE="php-fpm"
         fi
         
-        # 创建必要的目录
         mkdir -p /run/php
         mkdir -p /var/log/nginx
         chown nginx:nginx /run/php 2>/dev/null || true
         
-        # 确保 nginx 用户存在
         if ! id nginx &>/dev/null; then
             adduser -D -g 'nginx' nginx 2>/dev/null || true
         fi
@@ -387,17 +1007,14 @@ chown -R nginx:nginx "$PROJECT_DIR" 2>/dev/null || true
 
 # ========== 配置 PHP-FPM ==========
 if [ "$OS" = "alpine" ]; then
-    # 查找 PHP-FPM 配置文件
     PHP_FPM_CONF=$(find /etc/php* -name "www.conf" 2>/dev/null | head -1)
     if [ -n "$PHP_FPM_CONF" ]; then
-        # 配置 PHP-FPM 使用 Unix socket
         sed -i 's|^listen = 127.0.0.1:9000|listen = /run/php/php-fpm.sock|' "$PHP_FPM_CONF"
         sed -i 's|^listen = 9000|listen = /run/php/php-fpm.sock|' "$PHP_FPM_CONF"
         sed -i 's|^;listen.owner = nobody|listen.owner = nginx|' "$PHP_FPM_CONF"
         sed -i 's|^;listen.group = nobody|listen.group = nginx|' "$PHP_FPM_CONF"
         sed -i 's|^;listen.mode = 0660|listen.mode = 0660|' "$PHP_FPM_CONF"
         
-        # 确保 socket 目录存在
         mkdir -p /run/php
         chown nginx:nginx /run/php
     fi
@@ -406,7 +1023,6 @@ fi
 # ========== 配置 Nginx 虚拟主机 ==========
 echo -e "${GREEN}配置 Nginx...${NC}"
 
-# 确定配置文件目录
 if [ -d "/etc/nginx/http.d" ]; then
     NGINX_CONF_FILE="/etc/nginx/http.d/speedtest.conf"
 elif [ -d "/etc/nginx/conf.d" ]; then
@@ -448,7 +1064,6 @@ server {
 }
 EOF
 
-# 对于 Debian/Ubuntu 创建软链接
 if [ "$NGINX_CONF_FILE" = "/etc/nginx/sites-available/speedtest" ]; then
     ln -sf "$NGINX_CONF_FILE" /etc/nginx/sites-enabled/speedtest
 fi
@@ -460,7 +1075,6 @@ if [ $? -ne 0 ]; then
     echo -e "${RED}Nginx 配置测试失败${NC}"
     echo -e "${YELLOW}尝试修复配置...${NC}"
     
-    # 如果 socket 方式失败，尝试 TCP 方式
     sed -i 's|fastcgi_pass unix:/run/php/php-fpm.sock;|fastcgi_pass 127.0.0.1:9000;|' "$NGINX_CONF_FILE"
     nginx -t 2>&1
     if [ $? -ne 0 ]; then
@@ -475,16 +1089,12 @@ fi
 # ========== 启动服务 ==========
 echo -e "${GREEN}启动服务...${NC}"
 
-# 启动 PHP-FPM
 if command -v rc-service &>/dev/null; then
-    # Alpine OpenRC
     rc-service $PHP_FPM_SERVICE restart 2>/dev/null || {
-        # 尝试通用名称
         rc-service php-fpm restart 2>/dev/null || rc-service php-fpm82 restart 2>/dev/null || rc-service php-fpm83 restart 2>/dev/null
     }
     rc-update add $PHP_FPM_SERVICE default 2>/dev/null || true
     
-    # 启动 Nginx
     rc-service nginx restart
     rc-update add nginx default 2>/dev/null || true
 elif command -v systemctl &>/dev/null; then
@@ -514,13 +1124,14 @@ else
     echo -e "${YELLOW}⚠ PHP-FPM 可能未运行${NC}"
 fi
 
+# ========== 安装 st 命令 ==========
+install_st_command
+
 # ========== 最终信息 ==========
 sleep 1
 
-# 获取 IP 地址
 IP=$(curl -s -m 5 4.ipw.cn 2>/dev/null || curl -s -m 5 ipinfo.io/ip 2>/dev/null || curl -s -m 5 ifconfig.me 2>/dev/null || echo "服务器IP")
 
-# 测试本地访问
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$PORT 2>/dev/null)
 if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
     STATUS="可访问 (HTTP $HTTP_CODE)"
@@ -538,23 +1149,23 @@ echo -e "${YELLOW}项目目录:  $PROJECT_DIR${NC}"
 echo -e "${YELLOW}Nginx 配置: $NGINX_CONF_FILE${NC}"
 echo -e "${YELLOW}PHP-FPM:    $PHP_SOCKET${NC}"
 echo -e "${YELLOW}本地状态:  $STATUS${NC}"
-echo -e "  卸载:     $(basename "$0") uninstall"
+echo ""
+echo -e "${BOLD}${GREEN}使用方法:${NC}"
+echo -e "  管理菜单: ${BOLD}st${NC}"
+echo -e "  卸载:     ${BOLD}$(basename "$0") uninstall${NC}"
 echo -e "${GREEN}================================${NC}"
 
-# 如果服务未正常运行，显示调试信息
 if [ "$STATUS" = "请检查服务状态" ]; then
     echo -e "\n${YELLOW}调试信息:${NC}"
     echo -e "  1. 检查 Nginx 错误日志: tail -20 /var/log/nginx/error.log"
     echo -e "  2. 检查 PHP-FPM 状态: ps aux | grep php"
     echo -e "  3. 手动测试: curl -v http://127.0.0.1:$PORT"
-    echo -e "  4. 重启服务: rc-service nginx restart && rc-service php-fpm restart"
+    echo -e "  4. 使用管理菜单: st"
 fi
 
-# 显示 PHP 已加载的扩展
 echo -e "\n${GREEN}PHP 已加载扩展:${NC}"
 php -m | grep -E "ctype|mbstring|xml|curl|zip|gd|json|openssl" | sed 's/^/  - /'
 
-# 防火墙提醒
 if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     echo -e "\n${YELLOW}⚠ 请执行: ufw allow $PORT${NC}"
 elif command -v firewall-cmd &>/dev/null && firewall-cmd --state 2>/dev/null | grep -q "running"; then
