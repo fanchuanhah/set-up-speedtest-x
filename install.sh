@@ -121,8 +121,23 @@ uninstall() {
     # 删除项目目录
     rm -rf "$PROJECT_DIR"
 
-    # 询问是否卸载 Nginx + PHP
-    read -p "是否同时卸载 Nginx 和 PHP？(y/N): " REMOVE_NGINX
+    # 询问是否卸载 Nginx + PHP - 修复：从 /dev/tty 读取输入
+    echo -e "${YELLOW}是否同时卸载 Nginx 和 PHP？${NC}"
+    echo -e "${YELLOW}这将删除所有相关软件包！${NC}"
+    
+    # 尝试从 /dev/tty 读取，如果失败则从标准输入读取
+    if [ -t 0 ]; then
+        # 标准输入是终端，直接读取
+        read -p "请输入 (y/N): " REMOVE_NGINX
+    elif [ -e /dev/tty ]; then
+        # 通过管道执行时，从 /dev/tty 读取
+        read -p "请输入 (y/N): " REMOVE_NGINX < /dev/tty
+    else
+        # 无法交互，默认不卸载
+        echo -e "${YELLOW}无法获取输入，默认不卸载 Nginx 和 PHP${NC}"
+        REMOVE_NGINX="n"
+    fi
+    
     if [[ "$REMOVE_NGINX" =~ ^[Yy]$ ]]; then
         case $OS in
             alpine)
@@ -141,6 +156,8 @@ uninstall() {
                 ;;
         esac
         echo -e "${GREEN}Nginx 和 PHP 已卸载${NC}"
+    else
+        echo -e "${GREEN}保留 Nginx 和 PHP${NC}"
     fi
 
     # 清理日志文件
