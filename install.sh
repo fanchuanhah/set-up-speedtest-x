@@ -9,10 +9,10 @@
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 # ---------- 配置 ----------
-PORT=33332
 PROJECT_DIR="/www/wwwroot/speedtest"
 LOG_FILE="/var/log/speedtest_access.log"
 
@@ -36,6 +36,26 @@ check_port() {
         fi
     fi
     return 1  # 端口未被占用
+}
+
+# ========== 端口输入验证函数 ==========
+validate_port() {
+    local port=$1
+    # 检查是否为数字
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 端口必须为数字${NC}"
+        return 1
+    fi
+    # 检查端口范围
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo -e "${RED}错误: 端口范围必须在 1-65535 之间${NC}"
+        return 1
+    fi
+    # 检查是否为系统保留端口（可选）
+    if [ "$port" -lt 1024 ] && [ "$(id -u)" -ne 0 ]; then
+        echo -e "${YELLOW}警告: 端口 1-1023 为系统保留端口，需要 root 权限${NC}"
+    fi
+    return 0
 }
 
 # ========== 卸载函数 ==========
@@ -150,6 +170,29 @@ echo -e "${GREEN}操作系统: $OS${NC}"
 # ========== 如果执行卸载 ==========
 [ "$1" = "uninstall" ] && uninstall
 
+# ========== 端口输入 ==========
+echo -e "${BLUE}================================${NC}"
+echo -e "${BLUE}   请输入要使用的端口号${NC}"
+echo -e "${BLUE}================================${NC}"
+
+# 如果提供了命令行参数作为端口
+if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+    PORT=$1
+    echo -e "${GREEN}使用命令行参数端口: $PORT${NC}"
+else
+    # 交互式输入端口
+    while true; do
+        read -p "请输入端口号 (默认: 33332): " INPUT_PORT
+        PORT=${INPUT_PORT:-33332}
+        
+        if validate_port "$PORT"; then
+            break
+        fi
+    done
+fi
+
+echo -e "${GREEN}将使用端口: $PORT${NC}"
+
 # ========== 端口检测 ==========
 echo -e "${YELLOW}检测端口 $PORT 占用情况...${NC}"
 if check_port $PORT; then
@@ -163,35 +206,50 @@ if check_port $PORT; then
         lsof -i :$PORT
     fi
     
-    read -p "是否终止占用端口的进程并继续？(y/N): " KILL_PROCESS
-    if [[ "$KILL_PROCESS" =~ ^[Yy]$ ]]; then
-        # 获取占用端口的进程PID
-        if command -v ss &>/dev/null; then
-            PID=$(ss -tlnp | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
-        elif command -v netstat &>/dev/null; then
-            PID=$(netstat -tlnp | grep ":$PORT " | awk '{print $7}' | cut -d'/' -f1)
-        elif command -v lsof &>/dev/null; then
-            PID=$(lsof -ti :$PORT)
-        fi
-        
-        if [ -n "$PID" ]; then
-            echo -e "${YELLOW}终止进程 PID: $PID${NC}"
-            kill -9 $PID 2>/dev/null
-            sleep 1
-            if check_port $PORT; then
-                echo -e "${RED}端口 $PORT 仍然被占用，请手动处理${NC}"
-                exit 1
-            else
-                echo -e "${GREEN}端口 $PORT 已释放${NC}"
+    echo -e "\n${YELLOW}请选择操作:${NC}"
+    echo "  1) 终止占用进程并继续安装"
+    echo "  2) 更换端口重新安装"
+    echo "  3) 退出安装"
+    read -p "请选择 (1/2/3): " PORT_CHOICE
+    
+    case $PORT_CHOICE in
+        1)
+            # 获取占用端口的进程PID
+            if command -v ss &>/dev/null; then
+                PID=$(ss -tlnp | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
+            elif command -v netstat &>/dev/null; then
+                PID=$(netstat -tlnp | grep ":$PORT " | awk '{print $7}' | cut -d'/' -f1)
+            elif command -v lsof &>/dev/null; then
+                PID=$(lsof -ti :$PORT)
             fi
-        else
-            echo -e "${RED}无法获取进程PID，请手动处理${NC}"
+            
+            if [ -n "$PID" ]; then
+                echo -e "${YELLOW}终止进程 PID: $PID${NC}"
+                kill -9 $PID 2>/dev/null
+                sleep 1
+                if check_port $PORT; then
+                    echo -e "${RED}端口 $PORT 仍然被占用，请手动处理${NC}"
+                    exit 1
+                else
+                    echo -e "${GREEN}端口 $PORT 已释放${NC}"
+                fi
+            else
+                echo -e "${RED}无法获取进程PID，请手动处理${NC}"
+                exit 1
+            fi
+            ;;
+        2)
+            exec "$0"
+            ;;
+        3)
+            echo -e "${RED}安装终止${NC}"
             exit 1
-        fi
-    else
-        echo -e "${RED}安装终止${NC}"
-        exit 1
-    fi
+            ;;
+        *)
+            echo -e "${RED}无效选择，安装终止${NC}"
+            exit 1
+            ;;
+    esac
 else
     echo -e "${GREEN}端口 $PORT 可用${NC}"
 fi
